@@ -1,0 +1,69 @@
+---
+name: Tool drift
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    name: Tool drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Compare pinned release binaries with their latest releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          upstream_of() {
+            case "$1" in
+              GITLEAKS) echo gitleaks/gitleaks ;;
+              ACTIONLINT) echo rhysd/actionlint ;;
+              TERRAFORM_DOCS) echo terraform-docs/terraform-docs ;;
+              NFPM) echo goreleaser/nfpm ;;
+              TOFU) echo opentofu/opentofu ;;
+              TFLINT) echo terraform-linters/tflint ;;
+              *) return 1 ;;
+            esac
+          }
+          pins=$(find .github/workflows -name '*.y*ml' -exec sed -n \
+            's/^[[:space:]]*\([A-Z][A-Z0-9_]*\)_VERSION:[[:space:]]*["'\'']\{0,1\}v\{0,1\}\([0-9][0-9.]*\)["'\'']\{0,1\}[[:space:]]*\(#.*\)\{0,1\}$/\1 \2/p' {} + | sort -u)
+          if [ -z "$pins" ]; then
+            echo "::error::no <TOOL>_VERSION pins in .github/workflows, so this check would compare nothing"
+            exit 1
+          fi
+          printf '%s\n' "$pins" | while read -r tool current; do
+            if ! upstream=$(upstream_of "$tool"); then
+              echo "::warning::${tool}_VERSION has no known upstream; add it to the Tool drift workflow"
+              continue
+            fi
+            release=$(gh api "repos/${upstream}/releases/latest" --jq '[.tag_name, .html_url] | @tsv')
+            latest=$(printf '%s' "$release" | cut -f1); url=$(printf '%s' "$release" | cut -f2)
+            latest=${latest#v}
+            name=$(printf '%s' "$tool" | tr 'A-Z_' 'a-z-')
+            newest=$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)
+            if [ "$current" = "$latest" ] || [ "$newest" = "$current" ]; then
+              echo "${name}: ${current} is current (latest ${latest})"
+              continue
+            fi
+            title="Tool drift: ${name} ${current} is behind ${latest}"
+            body="\`${tool}_VERSION\` in \`.github/workflows\` pins ${current}, and the latest release of ${upstream} is ${latest} (${url})."
+            body="${body} Update the version, and its \`${tool}_SHA256\` checksum where the workflow pins one, from the release's checksums file."
+            open=$(gh issue list --state open --limit 100 --json number,title \
+              --jq ".[] | select(.title | startswith(\"Tool drift: ${name} \")) | .number" | head -n 1)
+            if [ -z "$open" ]; then
+              gh issue create --title "$title" --body "$body"
+            else
+              gh issue edit "$open" --title "$title" --body "$body"
+            fi
+            echo "::notice::${title}"
+          done
