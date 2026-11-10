@@ -18,12 +18,15 @@ jobs:
       - name: Check out code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Compare pinned release binaries with their latest releases
+      - name: Compare pinned versions with their latest releases
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          # A runtime line this many days or fewer from its end of life opens an issue.
+          EOL_WARN_DAYS: 183
         run: |
           set -eu
+          # Release binaries: compared with the upstream's latest GitHub release.
           upstream_of() {
             case "$1" in
               GITLEAKS) echo gitleaks/gitleaks ;;
@@ -35,35 +38,142 @@ jobs:
               *) return 1 ;;
             esac
           }
+          # Language runtimes publish no GitHub release to compare with: the pinned
+          # line is looked up by its endoflife.date product, which names the line's
+          # latest patch release and its end-of-life date.
+          runtime_of() {
+            case "$1" in
+              PYTHON) echo python ;;
+              NODE) echo nodejs ;;
+              GO) echo go ;;
+              *) return 1 ;;
+            esac
+          }
+          # Versions taken from the runner image, which the repository's own CI checks.
+          from_runner_image() {
+            case "$1" in
+              PHP) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          # Opens one issue per tool, or rewrites the one already open.
+          report() {
+            r_name=$1 r_title=$2 r_body=$3
+            r_open=$(gh issue list --state open --limit 100 --json number,title \
+              --jq ".[] | select(.title | startswith(\"Tool drift: ${r_name} \")) | .number" </dev/null | head -n 1)
+            if [ -z "$r_open" ]; then
+              gh issue create --title "$r_title" --body "$r_body" </dev/null
+            else
+              gh issue edit "$r_open" --title "$r_title" --body "$r_body" </dev/null
+            fi
+            echo "::notice::${r_title}"
+          }
+
           pins=$(find .github/workflows -name '*.y*ml' -exec sed -n \
             's/^[[:space:]]*\([A-Z][A-Z0-9_]*\)_VERSION:[[:space:]]*["'\'']\{0,1\}v\{0,1\}\([0-9][0-9.]*\)["'\'']\{0,1\}[[:space:]]*\(#.*\)\{0,1\}$/\1 \2/p' {} + | sort -u)
+          # setup-go installs the toolchain line when go.mod has one, otherwise the go line.
+          gomod=""
+          if [ -f go.mod ]; then
+            gomod=$(sed -n 's/^toolchain[[:space:]]\{1,\}go\([0-9][0-9.]*\)[[:space:]]*$/GO \1/p' go.mod)
+            if [ -z "$gomod" ]; then
+              gomod=$(sed -n 's/^go[[:space:]]\{1,\}\([0-9][0-9.]*\)[[:space:]]*$/GO \1/p' go.mod)
+            fi
+            pins=$(printf '%s\n%s\n' "$pins" "$gomod" | sed '/^$/d' | sort -u)
+          fi
           if [ -z "$pins" ]; then
             echo "::error::no <TOOL>_VERSION pins in .github/workflows, so this check would compare nothing"
             exit 1
           fi
-          printf '%s\n' "$pins" | while read -r tool current; do
+
+          failed=0
+          now=$(date -u +%s)
+          while read -r tool current; do
+            name=$(printf '%s' "$tool" | tr 'A-Z_' 'a-z-')
+            if [ "$tool" = GO ] && [ -n "$gomod" ]; then
+              where="\`go.mod\`"
+            else
+              where="\`${tool}_VERSION\` in \`.github/workflows\`"
+            fi
+
+            if from_runner_image "$tool"; then
+              echo "${name}: ${current} comes from the runner image; the repository's CI checks it"
+              continue
+            fi
+
+            if product=$(runtime_of "$tool"); then
+              case "$product" in
+                nodejs) cycle=${current%%.*} ;;
+                *) cycle=$(printf '%s' "$current" | cut -d. -f1-2) ;;
+              esac
+              url="https://endoflife.date/api/v1/products/${product}/releases/${cycle}"
+              if ! json=$(curl --proto "=https" --tlsv1.2 -sSf --retry 3 "$url" </dev/null); then
+                echo "::error::${name}: could not read ${url}"
+                failed=1
+                continue
+              fi
+              latest=$(printf '%s' "$json" | jq -r '.result.latest.name // empty')
+              eol=$(printf '%s' "$json" | jq -r '.result.eolFrom // empty')
+              is_eol=$(printf '%s' "$json" | jq -r '.result.isEol // false')
+              if [ -z "$latest" ]; then
+                echo "::error::${name}: ${url} names no latest release for ${cycle}"
+                failed=1
+                continue
+              fi
+              newest=$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)
+              behind=no
+              if [ "$current" != "$latest" ] && [ "$newest" != "$current" ]; then
+                behind=yes
+              fi
+              eol_note=""
+              if [ "$is_eol" = true ]; then
+                eol_note="The ${cycle} line reached its end of life${eol:+ on ${eol}}; move to a supported line."
+              elif [ -n "$eol" ] && [ $(( $(date -u -d "$eol" +%s) - now )) -le $(( EOL_WARN_DAYS * 86400 )) ]; then
+                eol_note="The ${cycle} line reaches its end of life on ${eol}; plan the move to a newer line."
+              fi
+              if [ "$behind" = no ] && [ -z "$eol_note" ]; then
+                echo "${name}: ${current} is current (latest ${cycle} release ${latest}${eol:+, end of life ${eol}})"
+                continue
+              fi
+              # A line past its end of life names that first; a newer patch would not fix it.
+              if [ "$is_eol" = true ]; then
+                title="Tool drift: ${name} ${cycle} reached its end of life${eol:+ on ${eol}}"
+              elif [ "$behind" = yes ]; then
+                title="Tool drift: ${name} ${current} is behind ${latest}"
+              else
+                title="Tool drift: ${name} ${cycle} ends its life on ${eol:-an announced date}"
+              fi
+              body="${where} pins ${current}; the latest ${cycle} release is ${latest} (${url})."
+              if [ "$behind" = yes ]; then
+                body="${body} Update the pin once the runner's setup action can install that release."
+              fi
+              if [ -n "$eol_note" ]; then
+                body="${body} ${eol_note}"
+              fi
+              report "$name" "$title" "$body"
+              continue
+            fi
+
             if ! upstream=$(upstream_of "$tool"); then
               echo "::warning::${tool}_VERSION has no known upstream; add it to the Tool drift workflow"
               continue
             fi
-            release=$(gh api "repos/${upstream}/releases/latest" --jq '[.tag_name, .html_url] | @tsv')
+            if ! release=$(gh api "repos/${upstream}/releases/latest" --jq '[.tag_name, .html_url] | @tsv' </dev/null); then
+              echo "::error::${name}: could not read the latest release of ${upstream}"
+              failed=1
+              continue
+            fi
             latest=$(printf '%s' "$release" | cut -f1); url=$(printf '%s' "$release" | cut -f2)
             latest=${latest#v}
-            name=$(printf '%s' "$tool" | tr 'A-Z_' 'a-z-')
             newest=$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)
             if [ "$current" = "$latest" ] || [ "$newest" = "$current" ]; then
               echo "${name}: ${current} is current (latest ${latest})"
               continue
             fi
             title="Tool drift: ${name} ${current} is behind ${latest}"
-            body="\`${tool}_VERSION\` in \`.github/workflows\` pins ${current}, and the latest release of ${upstream} is ${latest} (${url})."
+            body="${where} pins ${current}, and the latest release of ${upstream} is ${latest} (${url})."
             body="${body} Update the version, and its \`${tool}_SHA256\` checksum where the workflow pins one, from the release's checksums file."
-            open=$(gh issue list --state open --limit 100 --json number,title \
-              --jq ".[] | select(.title | startswith(\"Tool drift: ${name} \")) | .number" | head -n 1)
-            if [ -z "$open" ]; then
-              gh issue create --title "$title" --body "$body"
-            else
-              gh issue edit "$open" --title "$title" --body "$body"
-            fi
-            echo "::notice::${title}"
-          done
+            report "$name" "$title" "$body"
+          done <<EOF
+          $pins
+          EOF
+          exit "$failed"
