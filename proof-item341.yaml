@@ -1,0 +1,4 @@
+---
+# Proof for backlog item 341: yamllint --strict must refuse the colon spacing below.
+# Do not merge.
+proof:  item341
