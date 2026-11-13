@@ -35,6 +35,7 @@ jobs:
               NFPM) echo goreleaser/nfpm ;;
               TOFU) echo opentofu/opentofu ;;
               TFLINT) echo terraform-linters/tflint ;;
+              SNYK) echo snyk/cli ;;
               *) return 1 ;;
             esac
           }

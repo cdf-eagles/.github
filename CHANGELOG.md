@@ -1,5 +1,7 @@
 # Changelog
 
+- 2026-11-13
+  - The Tool drift workflow compares a `SNYK_VERSION` pin with the latest release of snyk/cli and opens an issue when it falls behind; it only warned that the pin had no known upstream. Found internally from backlog item 546.
 - 2026-11-09
   - The Tool drift workflow checks language runtimes: `PYTHON_VERSION` and `NODE_VERSION` pins and the Go version in `go.mod` are compared with their line's latest patch release on endoflife.date, and an issue opens when a newer patch exists or the line is within 183 days of, or past, its end of life. `PHP_VERSION`, which names the runner image's PHP, is skipped instead of warned about. A failed lookup now fails the job after the remaining pins are checked, instead of stopping at the first. Found internally from backlog item 382.
 - 2026-10-24
