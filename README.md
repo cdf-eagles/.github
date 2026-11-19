@@ -23,3 +23,5 @@ A repository calls it from a job that runs only on the schedule:
 ## Checks
 
 `pre-commit run --all-files` runs the same hooks as CI. `pre-commit install` installs them at commit and push time; the push hook runs gitleaks over the commits being pushed.
+
+CI's `Snyk` job tests the Python tools pinned in `ci/requirements.txt` and fails on any high or critical dependency issue, a scan error, or a missing `SNYK_TOKEN` secret. The secret is set both as an Actions secret and as a Dependabot secret, because Dependabot's pull requests cannot read Actions secrets; the Snyk CLI is pinned with its checksum in `.github/workflows/ci.yaml`.
